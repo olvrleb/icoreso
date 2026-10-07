@@ -2,7 +2,7 @@
 // @id              taskbar-crisp-icons
 // @name            Crisp Taskbar Icons
 // @description     Stops Windows from blurry/pixelated icon scaling on the taskbar by re-rendering icons at the exact pixel size from the highest resolution image in the .ico/.exe, using a high-quality resampling filter
-// @version         1.1.0
+// @version         1.2.0
 // @author          olvrleb
 // @github          https://github.com/olvrleb
 // @include         explorer.exe
@@ -62,8 +62,9 @@ right after it is enabled and after each icon setting change (turn off
 *Restart Explorer automatically* to do this yourself). Open File Explorer
 windows close when this happens.
 
-If icons still look unchanged, turn on *Debug logging* and check the log for
-`CreateBitmapFromHICON`, `Re-rendered` and `Window icon` lines.
+If icons still look unchanged, turn on *Debug logging* in the mod settings
+and open `%TEMP%\taskbar-crisp-icons.log` (Win+R). It lists which icon
+functions the taskbar calls and what the mod did.
 
 ## Notes
 
@@ -123,6 +124,7 @@ If icons still look unchanged, turn on *Debug logging* and check the log for
   $description: Asks Explorer to reload its in-memory icons so the change is visible without restarting
 - debugLogging: false
   $name: Debug logging
+  $description: Writes what the mod does to %TEMP%\taskbar-crisp-icons.log
 */
 // ==/WindhawkModSettings==
 
@@ -132,6 +134,8 @@ If icons still look unchanged, turn on *Debug logging* and check the log for
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
+#include <cwchar>
 #include <cstdint>
 #include <cstring>
 #include <list>
@@ -165,11 +169,55 @@ struct Settings {
 
 static Settings g_settings;
 
-#define LOG(...)                       \
-    do {                               \
-        if (g_settings.debugLogging) { \
-            Wh_Log(__VA_ARGS__);       \
-        }                              \
+// With debug logging on, messages go to Windhawk's log and to
+// %TEMP%\taskbar-crisp-icons.log, which also catches messages written while
+// Explorer restarts (Windhawk's log window only shows what arrives while it
+// is open).
+static void LogMessage(const wchar_t* format, ...) {
+    wchar_t message[1024];
+    va_list args;
+    va_start(args, format);
+    _vsnwprintf(message, ARRAYSIZE(message) - 1, format, args);
+    va_end(args);
+    message[ARRAYSIZE(message) - 1] = L'\0';
+
+    Wh_Log(L"%ls", message);
+
+    WCHAR path[MAX_PATH];
+    DWORD len = GetTempPathW(ARRAYSIZE(path), path);
+    if (!len || len > MAX_PATH - 32) {
+        return;
+    }
+    wcscat(path, L"taskbar-crisp-icons.log");
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t line[1200];
+    int n = _snwprintf(line, ARRAYSIZE(line) - 1,
+                       L"%02u:%02u:%02u.%03u [pid %lu] %ls\r\n", t.wHour,
+                       t.wMinute, t.wSecond, t.wMilliseconds,
+                       GetCurrentProcessId(), message);
+    if (n < 0) {
+        n = ARRAYSIZE(line) - 1;
+    }
+    char utf8[3600];
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, line, n, utf8, sizeof(utf8),
+                                    nullptr, nullptr);
+    DWORD written;
+    WriteFile(file, utf8, bytes, &written, nullptr);
+    CloseHandle(file);
+}
+
+#define LOG(...)                        \
+    do {                                \
+        if (g_settings.debugLogging) {  \
+            LogMessage(__VA_ARGS__);    \
+        }                               \
     } while (0)
 
 // Prevents our own processing from re-entering the hooks.
@@ -1087,6 +1135,29 @@ static std::wstring ModuleNameOf(void* address) {
     return name ? name + 1 : path;
 }
 
+// Debug: logs the first calls of each hook with the calling module, to see
+// which ones the taskbar actually uses.
+enum TraceId {
+    kTracePrivateExtractIcons,
+    kTraceLoadImage,
+    kTraceCopyImage,
+    kTraceDrawIconEx,
+    kTraceGetIcon,
+    kTraceCount
+};
+static volatile LONG g_traceCounts[kTraceCount];
+
+static void TraceCall(TraceId id, const wchar_t* name, void* caller, int cx,
+                      int cy) {
+    if (!g_settings.debugLogging ||
+        InterlockedIncrement(&g_traceCounts[id]) > 40) {
+        return;
+    }
+    LogMessage(L"%ls %dx%d from %ls%ls", name, cx, cy,
+               ModuleNameOf(caller).c_str(),
+               IsTaskbarCode(caller) ? L" (taskbar)" : L"");
+}
+
 static HWND PrimaryTaskbarWindow() {
     return FindWindowW(L"Shell_TrayWnd", nullptr);
 }
@@ -1112,7 +1183,7 @@ static HICON GetTaskbarSizedIcon(const IconPixels& px, int size) {
         IconPixels rendered;
         if (LoadGroupFromFile(file.c_str(), index, group) &&
             RenderGroup(group, size, size, ExactSize::BySetting, rendered)) {
-            LOG(L"Taskbar icon %dpx -> %dpx from source %s,%d", px.w, size,
+            LOG(L"Taskbar icon %dpx -> %dpx from source %ls,%d", px.w, size,
                 file.c_str(), index);
             icon = CreateIconFromPixels(rendered);
         }
@@ -1133,6 +1204,7 @@ static HICON UpgradeWindowIcon(HWND hwnd, HICON icon, void* caller) {
     if (!icon || !g_settings.upgradeWindowIcons || g_inHook) {
         return icon;
     }
+    TraceCall(kTraceGetIcon, L"WM_GETICON/GCLP_HICON", caller, 0, 0);
     HookGuard guard;
 
     if (!IsTaskbarCode(caller)) {
@@ -1170,7 +1242,7 @@ static HICON UpgradeWindowIcon(HWND hwnd, HICON icon, void* caller) {
         RenderGroup(group, original.w, original.h, ExactSize::Use,
                     exeAtOriginalSize)) {
         double diff = PixelDifference(original, exeAtOriginalSize);
-        LOG(L"Window icon %dpx -> %dpx, exe %s, difference %d/1000", original.w,
+        LOG(L"Window icon %dpx -> %dpx, exe %ls, difference %d/1000", original.w,
             target, exePath.c_str(), (int)(diff * 1000));
         IconPixels exeAtTarget;
         if (diff < 0.06 && RenderGroup(group, target, target,
@@ -1202,6 +1274,10 @@ static UINT WINAPI PrivateExtractIconsW_Hook(LPCWSTR fileName, int index,
                                              UINT count, UINT flags) {
     UINT result = PrivateExtractIconsW_Original(fileName, index, cxIcon, cyIcon,
                                                 icons, iconIds, count, flags);
+    if (icons) {
+        TraceCall(kTracePrivateExtractIcons, L"PrivateExtractIconsW",
+                  __builtin_return_address(0), LOWORD(cxIcon), LOWORD(cyIcon));
+    }
     if (!g_settings.improveExtractedIcons || g_inHook || !fileName || !icons ||
         result == 0 || result == (UINT)-1 ||
         (flags & (LR_MONOCHROME | LR_SHARED | LR_VGACOLOR))) {
@@ -1245,7 +1321,7 @@ static UINT WINAPI PrivateExtractIconsW_Hook(LPCWSTR fileName, int index,
 
         HICON better = RenderGroupIcon(*group, cx, cy);
         if (better) {
-            LOG(L"Re-rendered %s,%d at %dx%d", fileName, index + groupOffset,
+            LOG(L"Re-rendered %ls,%d at %dx%d", fileName, index + groupOffset,
                 cx, cy);
             DestroyIcon(icons[i]);
             icons[i] = better;
@@ -1263,6 +1339,10 @@ static HANDLE WINAPI LoadImageW_Hook(HINSTANCE instance, LPCWSTR name,
                                      UINT type, int cx, int cy, UINT flags) {
     HANDLE result =
         LoadImageW_Original(instance, name, type, cx, cy, flags);
+    if (type == IMAGE_ICON) {
+        TraceCall(kTraceLoadImage, L"LoadImageW", __builtin_return_address(0),
+                  cx, cy);
+    }
     const UINT allowedFlags =
         LR_LOADFROMFILE | LR_CREATEDIBSECTION | LR_LOADTRANSPARENT;
     if (!result || type != IMAGE_ICON || !g_settings.improveExtractedIcons ||
@@ -1309,6 +1389,10 @@ static CopyImage_t CopyImage_Original;
 
 static HANDLE WINAPI CopyImage_Hook(HANDLE image, UINT type, int cx, int cy,
                                     UINT flags) {
+    if (type == IMAGE_ICON) {
+        TraceCall(kTraceCopyImage, L"CopyImage", __builtin_return_address(0),
+                  cx, cy);
+    }
     const UINT allowedFlags =
         LR_COPYDELETEORG | LR_COPYRETURNORG | LR_CREATEDIBSECTION;
     if (type != IMAGE_ICON || !image || !g_settings.improveIconStretching ||
@@ -1342,6 +1426,8 @@ static DrawIconEx_t DrawIconEx_Original;
 static BOOL WINAPI DrawIconEx_Hook(HDC dc, int x, int y, HICON icon, int cx,
                                    int cy, UINT step, HBRUSH brush,
                                    UINT flags) {
+    TraceCall(kTraceDrawIconEx, L"DrawIconEx", __builtin_return_address(0), cx,
+              cy);
     if (!icon || !g_settings.improveIconStretching || g_inHook || cx <= 0 ||
         cy <= 0 || step != 0 || (flags & DI_NORMAL) != DI_NORMAL ||
         (flags & (DI_COMPAT | DI_DEFAULTSIZE))) {
@@ -1471,6 +1557,17 @@ static DWORD WINAPI GetClassLongW_Hook(HWND hwnd, int index) {
 }
 #endif
 
+static int g_hookFailures = 0;
+
+static void SetHook(const wchar_t* name, void* target, void* hook,
+                    void** original) {
+    if (!Wh_SetFunctionHook(target, hook, original)) {
+        g_hookFailures++;
+        Wh_Log(L"Failed to hook %ls", name);
+        LOG(L"Failed to hook %ls", name);
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Hook: the taskbar's own downscale
 //
@@ -1496,7 +1593,7 @@ static HRESULT STDMETHODCALLTYPE CreateBitmapFromHICON_Hook(void* self,
         IconPixels px;
         if (GetIconPixels(icon, px) && px.isIcon && px.w == px.h) {
             int target = GetTaskbarIconPixelSize(PrimaryTaskbarWindow());
-            LOG(L"CreateBitmapFromHICON %dpx from %s, taskbar size %dpx%s",
+            LOG(L"CreateBitmapFromHICON %dpx from %ls, taskbar size %dpx%ls",
                 px.w, ModuleNameOf(caller).c_str(), target,
                 taskbar ? L"" : L" (not taskbar, ignored)");
             // Only shrink: small icons (badges, buttons) stay as they are.
@@ -1517,9 +1614,10 @@ static void HookWicCreateBitmapFromHICON() {
                                    IID_IWICImagingFactory,
                                    (void**)&factory))) {
         void** vtable = *(void***)factory;
-        Wh_SetFunctionHook(vtable[kCreateBitmapFromHICONSlot],
-                           (void*)CreateBitmapFromHICON_Hook,
-                           (void**)&CreateBitmapFromHICON_Original);
+        SetHook(L"IWICImagingFactory::CreateBitmapFromHICON",
+                vtable[kCreateBitmapFromHICONSlot],
+                (void*)CreateBitmapFromHICON_Hook,
+                (void**)&CreateBitmapFromHICON_Original);
         factory->Release();
     } else {
         Wh_Log(L"Couldn't create a WIC factory, taskbar scaling fix disabled");
@@ -1577,7 +1675,7 @@ static void RefreshShellIcons() {
 }
 
 // Bump when a change to the rendering should trigger another restart.
-static constexpr int kRenderVersion = 2;
+static constexpr int kRenderVersion = 3;
 
 // Identifies everything that changes how icons look. Explorer is restarted
 // when it differs from the value saved at the last restart.
@@ -1643,6 +1741,7 @@ static void RestartExplorerIfNeeded() {
                        CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
                        nullptr, nullptr, &si, &pi)) {
         Wh_Log(L"Restarting Explorer to apply the new icons");
+        LOG(L"Restarting Explorer to apply the new icons");
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     } else {
@@ -1651,9 +1750,13 @@ static void RestartExplorerIfNeeded() {
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init");
     g_unloaded = 0;
     LoadSettings();
+    Wh_Log(L"Init");
+    WCHAR exe[MAX_PATH] = L"";
+    GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
+    LOG(L"Init: version 1.2.0 in %ls, taskbar icon size %dpx", exe,
+        GetTaskbarIconPixelSize(PrimaryTaskbarWindow()));
 
     HMODULE shcore = LoadLibraryW(L"shcore.dll");
     if (shcore) {
@@ -1661,36 +1764,39 @@ BOOL Wh_ModInit() {
             shcore, "GetDpiForMonitor");
     }
 
-    Wh_SetFunctionHook((void*)PrivateExtractIconsW,
-                       (void*)PrivateExtractIconsW_Hook,
-                       (void**)&PrivateExtractIconsW_Original);
-    Wh_SetFunctionHook((void*)LoadImageW, (void*)LoadImageW_Hook,
-                       (void**)&LoadImageW_Original);
-    Wh_SetFunctionHook((void*)CopyImage, (void*)CopyImage_Hook,
-                       (void**)&CopyImage_Original);
-    Wh_SetFunctionHook((void*)DrawIconEx, (void*)DrawIconEx_Hook,
-                       (void**)&DrawIconEx_Original);
-    Wh_SetFunctionHook((void*)SendMessageW, (void*)SendMessageW_Hook,
-                       (void**)&SendMessageW_Original);
-    Wh_SetFunctionHook((void*)SendMessageTimeoutW,
-                       (void*)SendMessageTimeoutW_Hook,
-                       (void**)&SendMessageTimeoutW_Original);
-    Wh_SetFunctionHook((void*)SendMessageCallbackW,
-                       (void*)SendMessageCallbackW_Hook,
-                       (void**)&SendMessageCallbackW_Original);
+    SetHook(L"PrivateExtractIconsW", (void*)PrivateExtractIconsW,
+            (void*)PrivateExtractIconsW_Hook,
+            (void**)&PrivateExtractIconsW_Original);
+    SetHook(L"LoadImageW", (void*)LoadImageW, (void*)LoadImageW_Hook,
+            (void**)&LoadImageW_Original);
+    SetHook(L"CopyImage", (void*)CopyImage, (void*)CopyImage_Hook,
+            (void**)&CopyImage_Original);
+    SetHook(L"DrawIconEx", (void*)DrawIconEx, (void*)DrawIconEx_Hook,
+            (void**)&DrawIconEx_Original);
+    SetHook(L"SendMessageW", (void*)SendMessageW, (void*)SendMessageW_Hook,
+            (void**)&SendMessageW_Original);
+    SetHook(L"SendMessageTimeoutW", (void*)SendMessageTimeoutW,
+            (void*)SendMessageTimeoutW_Hook,
+            (void**)&SendMessageTimeoutW_Original);
+    SetHook(L"SendMessageCallbackW", (void*)SendMessageCallbackW,
+            (void*)SendMessageCallbackW_Hook,
+            (void**)&SendMessageCallbackW_Original);
 #ifdef _WIN64
-    Wh_SetFunctionHook((void*)GetClassLongPtrW, (void*)GetClassLongPtrW_Hook,
-                       (void**)&GetClassLongPtrW_Original);
+    SetHook(L"GetClassLongPtrW", (void*)GetClassLongPtrW,
+            (void*)GetClassLongPtrW_Hook, (void**)&GetClassLongPtrW_Original);
 #else
-    Wh_SetFunctionHook((void*)GetClassLongW, (void*)GetClassLongW_Hook,
-                       (void**)&GetClassLongW_Original);
+    SetHook(L"GetClassLongW", (void*)GetClassLongW, (void*)GetClassLongW_Hook,
+            (void**)&GetClassLongW_Original);
 #endif
     HookWicCreateBitmapFromHICON();
+    LOG(L"Hooks set, %d failed", g_hookFailures);
 
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
+    LOG(L"AfterInit: shell process %d, restart stamp saved %d, current %d",
+        IsShellProcess(), Wh_GetIntValue(L"restartStamp", 0), RenderStamp());
     if (g_settings.refreshOnLoad) {
         RefreshShellIcons();
     }

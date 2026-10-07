@@ -56,8 +56,8 @@ unaffected. No files on disk are modified.
    change an icon setting.
 
 If icons still look unchanged, enable *Debug logging* in the mod's settings
-and check the log (*Advanced → Show log output*) for `CreateBitmapFromHICON`,
-`Re-rendered` and `Window icon` lines.
+and open `%TEMP%\taskbar-crisp-icons.log` (Win+R). It lists which icon
+functions the taskbar calls and what the mod did.
 
 ### Settings
 
