@@ -1,7 +1,8 @@
 // Exercises the mod's rendering pipeline outside Windhawk (runs under Wine or
 // Windows). Build:
 //   x86_64-w64-mingw32-g++ -std=c++20 -O2 -include windhawk_stub.h
-//       render_test.cpp -o render_test.exe -lgdi32 -luser32 -lshell32
+//       render_test.cpp -o render_test.exe -municode -lgdi32 -luser32
+//       -lshell32 -lole32 -lwindowscodecs
 // Usage: render_test.exe <icon.ico> <icon.exe> <outdir>
 #include "../mods/taskbar-crisp-icons.wh.cpp"
 
@@ -53,17 +54,26 @@ int wmain(int argc, wchar_t** argv) {
         CHECK(LoadGroupFromFile(ico, 0, g));
         CHECK(g.entries.size() == 4);
         bool exact;
-        const IconEntry* e = PickEntry(g, 30, 30, &exact);
+        const IconEntry* e = PickEntry(g, 30, 30, true, &exact);
         CHECK(e && e->w == 256 && !exact);  // auto: >= 2x target
-        e = PickEntry(g, 24, 24, &exact);
+        e = PickEntry(g, 24, 24, true, &exact);
         CHECK(e && e->w == 48 && !exact);
-        e = PickEntry(g, 32, 32, &exact);
+        e = PickEntry(g, 32, 32, true, &exact);
         CHECK(e && e->w == 32 && exact);
-        e = PickEntry(g, 300, 300, &exact);
+        e = PickEntry(g, 32, 32, false, &exact);
+        CHECK(e && e->w == 256 && !exact);  // high-res source even if exact
+        e = PickEntry(g, 300, 300, true, &exact);
         CHECK(e && e->w == 256 && !exact);  // upscale from largest
 
-        // Exact sizes are left to Windows.
-        CHECK(RenderGroupIcon(g, 32, 32) == nullptr);
+        // With "always use a high-res source", exact 32 px is re-rendered
+        // from 256 px; hand-made 16 px images are left to Windows.
+        CHECK(UseExactSize(16) && !UseExactSize(24));
+        HICON r32 = RenderGroupIcon(g, 32, 32);
+        CHECK(r32 != nullptr);
+        if (r32) {
+            DestroyIcon(r32);
+        }
+        CHECK(RenderGroupIcon(g, 16, 16) == nullptr);
 
         for (int size : {20, 24, 30, 36, 40, 64}) {
             HICON icon = RenderGroupIcon(g, size, size);
@@ -123,11 +133,11 @@ int wmain(int argc, wchar_t** argv) {
         IconGroup g;
         LoadGroupFromFile(ico, 0, g);
         IconPixels big, same;
-        CHECK(RenderGroup(g, 256, 256, false, big));
+        CHECK(RenderGroup(g, 256, 256, ExactSize::Use, big));
         same = ResamplePixels(big, 256, 256, Filter::Lanczos3);
         CHECK(PixelDifference(big, same) < 0.002);
         IconPixels at32;
-        CHECK(RenderGroup(g, 32, 32, false, at32));
+        CHECK(RenderGroup(g, 32, 32, ExactSize::Use, at32));
         IconPixels down = ResamplePixels(big, 32, 32, Filter::Lanczos3);
         double diff = PixelDifference(at32, down);
         printf("diff(32 entry, 256->32 lanczos) = %.4f\n", diff);
@@ -143,7 +153,7 @@ int wmain(int argc, wchar_t** argv) {
         IconGroup g;
         LoadGroupFromFile(ico, 0, g);
         IconPixels p48;
-        RenderGroup(g, 48, 48, false, p48);
+        RenderGroup(g, 48, 48, ExactSize::Use, p48);
         HICON src = CreateIconFromPixels(p48);
         HICON copy = (HICON)CopyImage_Hook(src, IMAGE_ICON, 30, 30, 0);
         CHECK(copy && Pixels(copy).w == 30);
@@ -162,6 +172,57 @@ int wmain(int argc, wchar_t** argv) {
         DestroyIcon(src);
         g_stretchCache.Clear(true);
     }
+
+    // The taskbar's own 32 -> 24 px downscale is replaced: an icon extracted
+    // at 32 px is recognized and re-rendered from its 256 px source.
+    {
+        HICON icon32 = nullptr;
+        UINT n = PrivateExtractIconsW_Hook(exe, 0, 32, 32, &icon32, nullptr, 1,
+                                           0);
+        CHECK(n == 1 && icon32);
+        IconPixels px32 = Pixels(icon32);
+        std::wstring file;
+        int index = 99;
+        CHECK(FindIconSource(px32, file, index) && index == 0);
+
+        HICON sized = GetTaskbarSizedIcon(px32, 24);
+        CHECK(sized && Pixels(sized).w == 24);
+
+        IconGroup g;
+        LoadGroupFromFile(exe, 0, g);
+        IconPixels direct;
+        RenderGroup(g, 24, 24, ExactSize::BySetting, direct);
+        CHECK(PixelDifference(Pixels(sized), direct) < 0.001);
+        Dump(Pixels(sized), out, "taskbar");
+
+        // Through the WIC hook (this exe counts as "taskbar code").
+        IWICImagingFactory* factory = nullptr;
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        CHECK(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                         CLSCTX_INPROC_SERVER,
+                                         IID_IWICImagingFactory,
+                                         (void**)&factory)));
+        if (factory) {
+            CreateBitmapFromHICON_Original = (CreateBitmapFromHICON_t)(
+                (*(void***)factory)[kCreateBitmapFromHICONSlot]);
+            IWICBitmap* bitmap = nullptr;
+            int target = GetTaskbarIconPixelSize(PrimaryTaskbarWindow());
+            CHECK(SUCCEEDED(
+                CreateBitmapFromHICON_Hook(factory, icon32, &bitmap)));
+            UINT w = 0, h = 0;
+            if (bitmap) {
+                bitmap->GetSize(&w, &h);
+                bitmap->Release();
+            }
+            printf("WIC bitmap %ux%u (taskbar size %d)\n", w, h, target);
+            CHECK((int)w == target && (int)h == target);
+            factory->Release();
+        }
+        DestroyIcon(icon32);
+        g_stretchCache.Clear(true);
+    }
+
+    CHECK(RenderStamp() != 0);
 
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     return g_failures ? 1 : 0;

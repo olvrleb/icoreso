@@ -2,11 +2,11 @@
 // @id              taskbar-crisp-icons
 // @name            Crisp Taskbar Icons
 // @description     Stops Windows from blurry/pixelated icon scaling on the taskbar by re-rendering icons at the exact pixel size from the highest resolution image in the .ico/.exe, using a high-quality resampling filter
-// @version         1.0.0
+// @version         1.1.0
 // @author          olvrleb
 // @github          https://github.com/olvrleb
 // @include         explorer.exe
-// @compilerOptions -lgdi32 -luser32
+// @compilerOptions -lgdi32 -luser32 -lole32 -lwindowscodecs -lshell32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -29,37 +29,54 @@ Windows picks and scales the image:
 * `DrawIconEx` / `CopyImage` stretch icons with nearest-neighbour style
   sampling - jagged.
 
-This mod fixes all of these inside `explorer.exe` (which hosts the taskbar):
+This mod fixes all of these inside `explorer.exe` (which hosts the taskbar).
+The idea: Windows always shrinks the icon itself, so the mod does the
+shrinking first, with a high-quality filter, and hands Windows an icon that
+already has the exact final pixel size. Windows' own downscale then has
+nothing left to do.
 
-1. **Shortcut, pinned and file icons** (`PrivateExtractIconsW`, `LoadImageW`):
-   when the `.ico`/`.exe` does not contain the exact requested size, the icon
-   is re-rendered from a much larger source image (by default one at least
-   2x the target, usually the 256 px image) using a Lanczos-3 filter in
-   premultiplied alpha. If the exact size exists it is used untouched.
-2. **Running app icons** (`WM_GETICON`, `GetClassLongPtrW`): when an app
-   returns an icon smaller than the taskbar needs, the mod loads the app's
-   own `.exe` icon at the exact taskbar size instead. It first verifies that
-   the window icon really is the exe icon (pixel comparison), so custom or
-   dynamic window icons are never replaced.
-3. **Icon stretching** (`DrawIconEx`, `CopyImage`): any icon drawn or copied
-   at a different size is resampled with the high-quality filter instead.
+1. **The taskbar's own downscale** (`IWICImagingFactory::CreateBitmapFromHICON`):
+   the taskbar converts icons (often 32 px) to bitmaps and shrinks them to its
+   icon size (24 px at 100%) itself. The mod hands it an icon rendered at the
+   exact final size instead - straight from the 256 px image when it knows
+   which file the icon came from.
+2. **Shortcut, pinned and file icons** (`PrivateExtractIconsW`, `LoadImageW`):
+   rendered from a high-resolution image (by default the smallest one at
+   least 2x the target, usually 256 px) with a Lanczos-3 filter in
+   premultiplied alpha, even when the file has an image of the requested
+   size. Hand-made 16 px images are kept.
+3. **Running app icons** (`WM_GETICON`, `GetClassLongPtrW`): any window icon
+   that isn't exactly the taskbar's pixel size is replaced with the app's
+   `.exe` icon rendered at that size (after a pixel comparison confirms it is
+   the same icon), or else a high-quality resample of the window's icon.
+4. **Icon stretching** (`DrawIconEx`, `CopyImage`): any icon drawn or copied
+   at a different size is resampled with the high-quality filter.
+
+Changes 1 and 3 only apply to the taskbar's own code, not Alt+Tab, Start or
+File Explorer windows.
 
 ## After enabling
 
-Explorer keeps a disk cache of already-rendered (blurry) icons. For the best
-result, clear it once after enabling the mod:
+The mod clears Explorer's icon cache and restarts Explorer by itself, once,
+right after it is enabled and after each icon setting change (turn off
+*Restart Explorer automatically* to do this yourself). Open File Explorer
+windows close when this happens.
 
-1. Run `ie4uinit.exe -show` (Win+R), **or** delete
-   `%LocalAppData%\Microsoft\Windows\Explorer\iconcache_*.db`.
-2. Restart Explorer (Task Manager -> Windows Explorer -> Restart) so running
-   apps re-send their icons.
+If icons still look unchanged, turn on *Debug logging* and check the log for
+`CreateBitmapFromHICON`, `Re-rendered` and `Window icon` lines.
 
 ## Notes
 
 * Nothing on disk is modified - no `.ico` or `.exe` files are touched.
+* The result can't be finer than the screen: at 100% scaling a taskbar icon
+  is 24x24 physical pixels. The mod makes those pixels a perfectly
+  anti-aliased render of the 256 px artwork; at 125%/150% scaling it gets
+  30/36 px to work with and looks correspondingly finer.
 * A source image can't contain detail it doesn't have: an app whose icon
   file only contains a 32 px image will be upscaled smoothly, not magically
   sharpened.
+* With taskbars on several monitors with different scaling, the primary
+  monitor's size is used for the taskbar downscale fix.
 * Store/UWP apps already ship scale-specific PNGs and are unaffected.
 */
 // ==/WindhawkModReadme==
@@ -69,9 +86,18 @@ result, clear it once after enabling the mod:
 - improveExtractedIcons: true
   $name: Re-render shortcut, pinned and file icons
   $description: Render icons from the best (largest) image in the .ico/.exe instead of letting Windows scale the nearest size
+- alwaysUseLargeSource: true
+  $name: Always render from a high-resolution image
+  $description: Even when the .ico/.exe has an image of exactly the requested size, render from a larger one. Hand-made 16 px images are still used as is
+- fixTaskbarScaling: true
+  $name: Hand the taskbar icons at its exact pixel size
+  $description: The taskbar converts icons to bitmaps and shrinks them itself (e.g. 32 px to 24 px) with a blurry filter. This gives it icons already rendered at the final size, so it has nothing left to shrink
 - upgradeWindowIcons: true
-  $name: Upgrade low-resolution running app icons
-  $description: When a running app gives the taskbar an icon smaller than the taskbar needs, use the app's own exe icon at the exact size
+  $name: Fix running app icons
+  $description: When a running app gives the taskbar an icon that isn't exactly the taskbar's pixel size, replace it with the app's exe icon rendered at that size (or a high-quality resample of the app's icon)
+- autoRestartExplorer: true
+  $name: Restart Explorer automatically
+  $description: Clears the icon cache and restarts Windows Explorer once when the mod is enabled or an icon setting changes, so the new icons show up. Open File Explorer windows will close
 - improveIconStretching: true
   $name: High-quality icon stretching
   $description: Resample icons drawn or copied at a different size (DrawIconEx, CopyImage) with the selected filter
@@ -102,6 +128,7 @@ result, clear it once after enabling the mod:
 
 #include <windows.h>
 #include <shlobj.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <cmath>
@@ -124,7 +151,10 @@ enum class Filter { Lanczos3, CatmullRom, Mitchell, Box };
 
 struct Settings {
     bool improveExtractedIcons = true;
+    bool alwaysUseLargeSource = true;
+    bool fixTaskbarScaling = true;
     bool upgradeWindowIcons = true;
+    bool autoRestartExplorer = true;
     bool improveIconStretching = true;
     int taskbarIconSize = 24;
     SourcePreference sourcePreference = SourcePreference::Auto;
@@ -724,8 +754,14 @@ static bool LoadGroupFromFile(LPCWSTR path, int index, IconGroup& g) {
     return LoadGroupFromIcoData(g);
 }
 
+// Whether an image of exactly the requested size should be used as is.
+// Small images are usually hand-tuned and crisper than any downscale.
+static bool UseExactSize(int size) {
+    return !g_settings.alwaysUseLargeSource || size <= 16;
+}
+
 static const IconEntry* PickEntry(const IconGroup& g, int cx, int cy,
-                                  bool* exact) {
+                                  bool preferExact, bool* exact) {
     *exact = false;
     int maxBpp = 0;
     for (const IconEntry& e : g.entries) {
@@ -767,7 +803,7 @@ static const IconEntry* PickEntry(const IconGroup& g, int cx, int cy,
         }
     }
 
-    if (exactEntry) {
+    if (exactEntry && preferExact) {
         *exact = true;
         return exactEntry;
     }
@@ -788,13 +824,20 @@ static const IconEntry* PickEntry(const IconGroup& g, int cx, int cy,
     return largest;
 }
 
-// Renders the group at exactly cx x cy. With skipIfExact, returns false when
-// the group already has that size, so Windows' own (lossless) result is kept.
-static bool RenderGroup(const IconGroup& g, int cx, int cy, bool skipIfExact,
+enum class ExactSize {
+    Skip,       // return false if the exact size is used (Windows has it)
+    Use,        // use the exact size if available
+    BySetting,  // use it only if UseExactSize() says so
+};
+
+// Renders the group at exactly cx x cy.
+static bool RenderGroup(const IconGroup& g, int cx, int cy, ExactSize mode,
                         IconPixels& out) {
+    bool preferExact = mode == ExactSize::Use ||
+                       UseExactSize(std::max(cx, cy));
     bool exact;
-    const IconEntry* e = PickEntry(g, cx, cy, &exact);
-    if (!e || (exact && skipIfExact)) {
+    const IconEntry* e = PickEntry(g, cx, cy, preferExact, &exact);
+    if (!e || (exact && mode == ExactSize::Skip)) {
         return false;
     }
 
@@ -824,7 +867,7 @@ static bool RenderGroup(const IconGroup& g, int cx, int cy, bool skipIfExact,
 
 static HICON RenderGroupIcon(const IconGroup& g, int cx, int cy) {
     IconPixels p;
-    if (!RenderGroup(g, cx, cy, true, p)) {
+    if (!RenderGroup(g, cx, cy, ExactSize::Skip, p)) {
         return nullptr;
     }
     return CreateIconFromPixels(p);
@@ -955,14 +998,146 @@ static bool GetProcessImagePath(DWORD pid, std::wstring& path) {
     return ok;
 }
 
-// Called with the icon a window gave the taskbar. If it is smaller than the
-// taskbar needs and is the app's exe icon, returns the exe icon rendered at
-// the exact taskbar size. The returned icon is owned by the cache.
-static HICON UpgradeWindowIcon(HWND hwnd, HICON icon) {
+////////////////////////////////////////////////////////////////////////////////
+// Where icons came from
+//
+// Icons get copied around (image lists, CopyIcon, ...) before the taskbar
+// draws them, so they're recognized by their pixels. Knowing the source file
+// lets the final taskbar-sized icon be rendered straight from the 256 px
+// image instead of from an intermediate 32 px copy.
+
+struct IconSource {
+    uint64_t hash;
+    std::wstring file;
+    int index;
+};
+
+static SRWLOCK g_sourcesLock = SRWLOCK_INIT;
+static std::list<IconSource> g_sources;
+
+static uint64_t HashForSource(const IconPixels& p) {
+    return HashPixels(p, 0x50524353, 0, 0);
+}
+
+static void RememberIconSource(HICON icon, LPCWSTR file, int index) {
+    IconPixels p;
+    if (!GetIconPixels(icon, p)) {
+        return;
+    }
+    uint64_t hash = HashForSource(p);
+    AcquireSRWLockExclusive(&g_sourcesLock);
+    for (auto it = g_sources.begin(); it != g_sources.end(); ++it) {
+        if (it->hash == hash) {
+            g_sources.erase(it);
+            break;
+        }
+    }
+    g_sources.push_front({hash, file, index});
+    if (g_sources.size() > 512) {
+        g_sources.pop_back();
+    }
+    ReleaseSRWLockExclusive(&g_sourcesLock);
+}
+
+static bool FindIconSource(const IconPixels& p, std::wstring& file,
+                           int& index) {
+    uint64_t hash = HashForSource(p);
+    bool found = false;
+    AcquireSRWLockShared(&g_sourcesLock);
+    for (const IconSource& s : g_sources) {
+        if (s.hash == hash) {
+            file = s.file;
+            index = s.index;
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_sourcesLock);
+    return found;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Taskbar detection
+
+// True if the code at `address` belongs to the taskbar (Taskbar.dll and
+// Taskbar.View.dll on Windows 11, explorer.exe itself on Windows 10). Keeps
+// Alt+Tab, Start and File Explorer windows out of the taskbar-only changes.
+static bool IsTaskbarCode(void* address) {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)address, &module) ||
+        !module) {
+        return false;
+    }
+    return module == GetModuleHandleW(nullptr) ||
+           module == GetModuleHandleW(L"Taskbar.dll") ||
+           module == GetModuleHandleW(L"Taskbar.View.dll");
+}
+
+static std::wstring ModuleNameOf(void* address) {
+    HMODULE module = nullptr;
+    WCHAR path[MAX_PATH] = L"?";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)address, &module)) {
+        GetModuleFileNameW(module, path, ARRAYSIZE(path));
+    }
+    const WCHAR* name = wcsrchr(path, L'\\');
+    return name ? name + 1 : path;
+}
+
+static HWND PrimaryTaskbarWindow() {
+    return FindWindowW(L"Shell_TrayWnd", nullptr);
+}
+
+// Renders an icon at exactly size x size for the taskbar: from its source
+// file's best image if known, otherwise by resampling its pixels. Owned by
+// the cache.
+static HICON GetTaskbarSizedIcon(const IconPixels& px, int size) {
+    uint64_t key = HashPixels(px, size, 0x54424152,
+                              (int)g_settings.filter * 16 +
+                                  (int)g_settings.sourcePreference * 2 +
+                                  g_settings.alwaysUseLargeSource);
+    HICON icon;
+    if (g_stretchCache.Lookup(key, &icon)) {
+        return icon;
+    }
+
+    icon = nullptr;
+    std::wstring file;
+    int index;
+    if (FindIconSource(px, file, index)) {
+        IconGroup group;
+        IconPixels rendered;
+        if (LoadGroupFromFile(file.c_str(), index, group) &&
+            RenderGroup(group, size, size, ExactSize::BySetting, rendered)) {
+            LOG(L"Taskbar icon %dpx -> %dpx from source %s,%d", px.w, size,
+                file.c_str(), index);
+            icon = CreateIconFromPixels(rendered);
+        }
+    }
+    if (!icon) {
+        LOG(L"Taskbar icon %dpx -> %dpx resampled", px.w, size);
+        icon = CreateIconFromPixels(
+            ResamplePixels(px, size, size, g_settings.filter));
+    }
+    return g_stretchCache.Insert(key, icon);
+}
+
+// Called with the icon a running window gave the taskbar. Unless it already
+// is exactly the taskbar's pixel size, returns the app's exe icon rendered at
+// that size (if the window icon is the exe icon), or else a high-quality
+// resample of the window icon. The returned icon is owned by the cache.
+static HICON UpgradeWindowIcon(HWND hwnd, HICON icon, void* caller) {
     if (!icon || !g_settings.upgradeWindowIcons || g_inHook) {
         return icon;
     }
     HookGuard guard;
+
+    if (!IsTaskbarCode(caller)) {
+        return icon;
+    }
 
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
@@ -973,13 +1148,14 @@ static HICON UpgradeWindowIcon(HWND hwnd, HICON icon) {
     int target = GetTaskbarIconPixelSize(hwnd);
     IconPixels original;
     if (!GetIconPixels(icon, original) || !original.isIcon ||
-        original.w >= target || original.w != original.h) {
+        original.w == target || original.w != original.h) {
         return icon;
     }
 
     uint64_t key = HashPixels(original, target, (int)pid,
                               (int)g_settings.filter * 16 +
-                                  (int)g_settings.sourcePreference);
+                                  (int)g_settings.sourcePreference * 2 +
+                                  g_settings.alwaysUseLargeSource);
     HICON upgraded;
     if (g_windowIconCache.Lookup(key, &upgraded)) {
         return upgraded ? upgraded : icon;
@@ -991,15 +1167,22 @@ static HICON UpgradeWindowIcon(HWND hwnd, HICON icon) {
     IconPixels exeAtOriginalSize;
     if (GetProcessImagePath(pid, exePath) &&
         LoadGroupFromFile(exePath.c_str(), 0, group) &&
-        RenderGroup(group, original.w, original.h, false, exeAtOriginalSize)) {
+        RenderGroup(group, original.w, original.h, ExactSize::Use,
+                    exeAtOriginalSize)) {
         double diff = PixelDifference(original, exeAtOriginalSize);
         LOG(L"Window icon %dpx -> %dpx, exe %s, difference %d/1000", original.w,
             target, exePath.c_str(), (int)(diff * 1000));
         IconPixels exeAtTarget;
-        if (diff < 0.06 &&
-            RenderGroup(group, target, target, false, exeAtTarget)) {
+        if (diff < 0.06 && RenderGroup(group, target, target,
+                                       ExactSize::BySetting, exeAtTarget)) {
             upgraded = CreateIconFromPixels(exeAtTarget);
         }
+    }
+    if (!upgraded) {
+        // Custom window icon: at least scale it properly.
+        LOG(L"Window icon %dpx -> %dpx resampled", original.w, target);
+        upgraded = CreateIconFromPixels(
+            ResamplePixels(original, target, target, g_settings.filter));
     }
 
     upgraded = g_windowIconCache.Insert(key, upgraded);
@@ -1067,6 +1250,8 @@ static UINT WINAPI PrivateExtractIconsW_Hook(LPCWSTR fileName, int index,
             DestroyIcon(icons[i]);
             icons[i] = better;
         }
+        RememberIconSource(icons[i], fileName,
+                           index < 0 ? index : index + groupOffset);
     }
     return result;
 }
@@ -1099,11 +1284,21 @@ static HANDLE WINAPI LoadImageW_Hook(HINSTANCE instance, LPCWSTR name,
     }
 
     HICON better = RenderGroupIcon(group, cx, cy);
-    if (!better) {
-        return result;
+    if (better) {
+        DestroyIcon((HICON)result);
+        result = better;
     }
-    DestroyIcon((HICON)result);
-    return better;
+
+    if (flags & LR_LOADFROMFILE) {
+        RememberIconSource((HICON)result, name, 0);
+    } else if (IS_INTRESOURCE(name)) {
+        WCHAR modulePath[MAX_PATH];
+        if (GetModuleFileNameW(instance, modulePath, ARRAYSIZE(modulePath))) {
+            RememberIconSource((HICON)result, modulePath,
+                               -(int)(ULONG_PTR)name);
+        }
+    }
+    return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1176,7 +1371,8 @@ static LRESULT WINAPI SendMessageW_Hook(HWND hwnd, UINT msg, WPARAM wParam,
                                         LPARAM lParam) {
     LRESULT result = SendMessageW_Original(hwnd, msg, wParam, lParam);
     if (msg == WM_GETICON && wParam == ICON_BIG && result) {
-        result = (LRESULT)UpgradeWindowIcon(hwnd, (HICON)result);
+        result = (LRESULT)UpgradeWindowIcon(hwnd, (HICON)result,
+                                            __builtin_return_address(0));
     }
     return result;
 }
@@ -1193,7 +1389,8 @@ static LRESULT WINAPI SendMessageTimeoutW_Hook(HWND hwnd, UINT msg,
                                                flags, timeout, resultOut);
     if (ret && msg == WM_GETICON && wParam == ICON_BIG && resultOut &&
         *resultOut && hwnd != HWND_BROADCAST) {
-        *resultOut = (DWORD_PTR)UpgradeWindowIcon(hwnd, (HICON)*resultOut);
+        *resultOut = (DWORD_PTR)UpgradeWindowIcon(
+            hwnd, (HICON)*resultOut, __builtin_return_address(0));
     }
     return ret;
 }
@@ -1203,6 +1400,7 @@ static LRESULT WINAPI SendMessageTimeoutW_Hook(HWND hwnd, UINT msg,
 struct GetIconCallbackContext {
     SENDASYNCPROC callback;
     ULONG_PTR data;
+    void* caller;
 };
 
 static volatile LONG g_pendingCallbacks = 0;
@@ -1213,7 +1411,7 @@ static void CALLBACK GetIconCallback(HWND hwnd, UINT msg, ULONG_PTR data,
     auto* ctx = (GetIconCallbackContext*)data;
     InterlockedDecrement(&g_pendingCallbacks);
     if (!g_unloaded && result) {
-        result = (LRESULT)UpgradeWindowIcon(hwnd, (HICON)result);
+        result = (LRESULT)UpgradeWindowIcon(hwnd, (HICON)result, ctx->caller);
     }
     SENDASYNCPROC callback = ctx->callback;
     ULONG_PTR originalData = ctx->data;
@@ -1235,7 +1433,8 @@ static BOOL WINAPI SendMessageCallbackW_Hook(HWND hwnd, UINT msg,
                                              callback, data);
     }
 
-    auto* ctx = new GetIconCallbackContext{callback, data};
+    auto* ctx = new GetIconCallbackContext{callback, data,
+                                           __builtin_return_address(0)};
     InterlockedIncrement(&g_pendingCallbacks);
     BOOL ok = SendMessageCallbackW_Original(hwnd, msg, wParam, lParam,
                                            GetIconCallback, (ULONG_PTR)ctx);
@@ -1253,7 +1452,8 @@ static GetClassLongPtrW_t GetClassLongPtrW_Original;
 static ULONG_PTR WINAPI GetClassLongPtrW_Hook(HWND hwnd, int index) {
     ULONG_PTR result = GetClassLongPtrW_Original(hwnd, index);
     if (index == GCLP_HICON && result) {
-        result = (ULONG_PTR)UpgradeWindowIcon(hwnd, (HICON)result);
+        result = (ULONG_PTR)UpgradeWindowIcon(hwnd, (HICON)result,
+                                              __builtin_return_address(0));
     }
     return result;
 }
@@ -1264,11 +1464,70 @@ static GetClassLongW_t GetClassLongW_Original;
 static DWORD WINAPI GetClassLongW_Hook(HWND hwnd, int index) {
     DWORD result = GetClassLongW_Original(hwnd, index);
     if (index == GCL_HICON && result) {
-        result = (DWORD)(ULONG_PTR)UpgradeWindowIcon(hwnd, (HICON)result);
+        result = (DWORD)(ULONG_PTR)UpgradeWindowIcon(
+            hwnd, (HICON)result, __builtin_return_address(0));
     }
     return result;
 }
 #endif
+
+////////////////////////////////////////////////////////////////////////////////
+// Hook: the taskbar's own downscale
+//
+// The taskbar turns icons into bitmaps with
+// IWICImagingFactory::CreateBitmapFromHICON and then shrinks the bitmap to
+// its icon size itself (e.g. 32 px -> 24 px) with a cheap filter. Handing it
+// an icon that already has the final pixel size leaves nothing to shrink.
+
+using CreateBitmapFromHICON_t = HRESULT(STDMETHODCALLTYPE*)(void*, HICON,
+                                                            IWICBitmap**);
+static CreateBitmapFromHICON_t CreateBitmapFromHICON_Original;
+// Position of CreateBitmapFromHICON in the IWICImagingFactory vtable.
+static constexpr int kCreateBitmapFromHICONSlot = 22;
+
+static HRESULT STDMETHODCALLTYPE CreateBitmapFromHICON_Hook(void* self,
+                                                            HICON icon,
+                                                            IWICBitmap** out) {
+    void* caller = __builtin_return_address(0);
+    HICON replacement = nullptr;
+    if (icon && g_settings.fixTaskbarScaling && !g_inHook) {
+        HookGuard guard;
+        bool taskbar = IsTaskbarCode(caller);
+        IconPixels px;
+        if (GetIconPixels(icon, px) && px.isIcon && px.w == px.h) {
+            int target = GetTaskbarIconPixelSize(PrimaryTaskbarWindow());
+            LOG(L"CreateBitmapFromHICON %dpx from %s, taskbar size %dpx%s",
+                px.w, ModuleNameOf(caller).c_str(), target,
+                taskbar ? L"" : L" (not taskbar, ignored)");
+            // Only shrink: small icons (badges, buttons) stay as they are.
+            if (taskbar && px.w > target && px.w <= 256) {
+                replacement = GetTaskbarSizedIcon(px, target);
+            }
+        }
+    }
+    return CreateBitmapFromHICON_Original(self, replacement ? replacement : icon,
+                                         out);
+}
+
+static void HookWicCreateBitmapFromHICON() {
+    HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory* factory = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                   CLSCTX_INPROC_SERVER,
+                                   IID_IWICImagingFactory,
+                                   (void**)&factory))) {
+        void** vtable = *(void***)factory;
+        Wh_SetFunctionHook(vtable[kCreateBitmapFromHICONSlot],
+                           (void*)CreateBitmapFromHICON_Hook,
+                           (void**)&CreateBitmapFromHICON_Original);
+        factory->Release();
+    } else {
+        Wh_Log(L"Couldn't create a WIC factory, taskbar scaling fix disabled");
+    }
+    if (SUCCEEDED(init)) {
+        CoUninitialize();
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Mod lifecycle
@@ -1276,7 +1535,10 @@ static DWORD WINAPI GetClassLongW_Hook(HWND hwnd, int index) {
 static void LoadSettings() {
     g_settings.improveExtractedIcons =
         Wh_GetIntSetting(L"improveExtractedIcons");
+    g_settings.alwaysUseLargeSource = Wh_GetIntSetting(L"alwaysUseLargeSource");
+    g_settings.fixTaskbarScaling = Wh_GetIntSetting(L"fixTaskbarScaling");
     g_settings.upgradeWindowIcons = Wh_GetIntSetting(L"upgradeWindowIcons");
+    g_settings.autoRestartExplorer = Wh_GetIntSetting(L"autoRestartExplorer");
     g_settings.improveIconStretching =
         Wh_GetIntSetting(L"improveIconStretching");
     g_settings.taskbarIconSize = Wh_GetIntSetting(L"taskbarIconSize");
@@ -1314,6 +1576,80 @@ static void RefreshShellIcons() {
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
 }
 
+// Bump when a change to the rendering should trigger another restart.
+static constexpr int kRenderVersion = 2;
+
+// Identifies everything that changes how icons look. Explorer is restarted
+// when it differs from the value saved at the last restart.
+static int RenderStamp() {
+    int values[] = {kRenderVersion,
+                    g_settings.improveExtractedIcons,
+                    g_settings.alwaysUseLargeSource,
+                    g_settings.fixTaskbarScaling,
+                    g_settings.upgradeWindowIcons,
+                    g_settings.improveIconStretching,
+                    g_settings.taskbarIconSize,
+                    (int)g_settings.sourcePreference,
+                    (int)g_settings.filter};
+    uint64_t h = HashBytes(14695981039346656037ULL, values, sizeof(values));
+    return (int)(h & 0x7FFFFFFF) | 1;
+}
+
+static bool IsShellProcess() {
+    HWND tray = PrimaryTaskbarWindow();
+    DWORD pid = 0;
+    return tray && GetWindowThreadProcessId(tray, &pid) &&
+           pid == GetCurrentProcessId();
+}
+
+// Clears the icon cache and restarts Explorer once per rendering change. The
+// saved stamp makes sure the restarted Explorer doesn't restart again.
+static void RestartExplorerIfNeeded() {
+    if (!g_settings.autoRestartExplorer || !IsShellProcess()) {
+        return;
+    }
+    int stamp = RenderStamp();
+    if (Wh_GetIntValue(L"restartStamp", 0) == stamp) {
+        return;
+    }
+    if (!Wh_SetIntValue(L"restartStamp", stamp)) {
+        Wh_Log(L"Couldn't save restart state, not restarting Explorer");
+        return;
+    }
+
+    // A detached cmd.exe outlives this Explorer: it kills Explorer, deletes
+    // the icon cache while nothing holds it, starts Explorer again unless
+    // Windows already did, and finally refreshes the icon cache.
+    WCHAR command[] =
+        L"cmd.exe /d /s /c \""
+        L"ping -n 2 127.0.0.1 >nul"
+        L" & taskkill /f /im explorer.exe >nul 2>&1"
+        L" & ping -n 2 127.0.0.1 >nul"
+        L" & del /f /q /a \"%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer\\"
+        L"iconcache_*.db\" >nul 2>&1"
+        L" & del /f /q /a \"%LOCALAPPDATA%\\IconCache.db\" >nul 2>&1"
+        L" & (tasklist /fi \"imagename eq explorer.exe\" | find /i "
+        L"\"explorer.exe\" >nul || start \"\" \"%WINDIR%\\explorer.exe\")"
+        L" & ping -n 4 127.0.0.1 >nul"
+        L" & ie4uinit.exe -show\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, command, nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP |
+                           CREATE_BREAKAWAY_FROM_JOB,
+                       nullptr, nullptr, &si, &pi) ||
+        CreateProcessW(nullptr, command, nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                       nullptr, nullptr, &si, &pi)) {
+        Wh_Log(L"Restarting Explorer to apply the new icons");
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    } else {
+        Wh_Log(L"Couldn't start the Explorer restart: %u", GetLastError());
+    }
+}
+
 BOOL Wh_ModInit() {
     Wh_Log(L"Init");
     g_unloaded = 0;
@@ -1349,6 +1685,7 @@ BOOL Wh_ModInit() {
     Wh_SetFunctionHook((void*)GetClassLongW, (void*)GetClassLongW_Hook,
                        (void**)&GetClassLongW_Original);
 #endif
+    HookWicCreateBitmapFromHICON();
 
     return TRUE;
 }
@@ -1357,6 +1694,7 @@ void Wh_ModAfterInit() {
     if (g_settings.refreshOnLoad) {
         RefreshShellIcons();
     }
+    RestartExplorerIfNeeded();
 }
 
 void Wh_ModUninit() {
@@ -1389,4 +1727,5 @@ void Wh_ModSettingsChanged() {
     if (g_settings.refreshOnLoad) {
         RefreshShellIcons();
     }
+    RestartExplorerIfNeeded();
 }

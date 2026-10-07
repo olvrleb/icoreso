@@ -18,3 +18,6 @@ inline PCWSTR Wh_GetStringSetting(PCWSTR name) {
 }
 inline void Wh_FreeStringSetting(PCWSTR) {}
 inline BOOL Wh_SetFunctionHook(void*, void*, void**) { return TRUE; }
+inline int g_stubIntValue = 0;
+inline int Wh_GetIntValue(PCWSTR, int def) { return g_stubIntValue ? g_stubIntValue : def; }
+inline BOOL Wh_SetIntValue(PCWSTR, int v) { g_stubIntValue = v; return TRUE; }

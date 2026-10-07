@@ -15,7 +15,7 @@ cp "$here/test_app.rc" "$build/app.rc"
 
 x86_64-w64-mingw32-g++ -municode -std=c++20 -O2 -Wall -Wextra \
     -include "$here/windhawk_stub.h" "$here/render_test.cpp" \
-    -o "$build/render_test.exe" -lgdi32 -luser32 -lshell32 -static
+    -o "$build/render_test.exe" -lgdi32 -luser32 -lshell32 -lole32 -lwindowscodecs -static
 
 wine_bin="$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)"
 runner=()
